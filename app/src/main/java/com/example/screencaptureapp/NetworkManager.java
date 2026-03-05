@@ -4,6 +4,11 @@ import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.Bitmap.CompressFormat;
 import android.util.Log;
+
+import com.google.gson.Gson;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
+
 import okhttp3.*;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -70,7 +75,7 @@ public class NetworkManager {
         bitmap.compress(CompressFormat.JPEG, 70, stream);
         byte[] byteArray = stream.toByteArray();
 
-        RequestBody requestBody = new MultipartBody.Builder()
+        /*RequestBody requestBody = new MultipartBody.Builder()
                 .setType(MultipartBody.FORM)
                 .addFormDataPart("image", "screen_capture.jpg",
                         RequestBody.create(MediaType.parse("image/jpeg"), byteArray))
@@ -82,6 +87,26 @@ public class NetworkManager {
                 .url(UPLOAD_URL)
                 .post(requestBody)
                 .addHeader("User-Agent", "ScreenCaptureApp/1.0")
+                .build();*/
+        String base64Image = android.util.Base64.encodeToString(byteArray, android.util.Base64.DEFAULT);
+
+        Gson gson = new Gson();
+        JsonArray imagesArray = new JsonArray();
+        imagesArray.add(base64Image);
+
+        JsonObject jsonBody = new JsonObject();
+        jsonBody.add("images", imagesArray);
+
+        String jsonString = gson.toJson(jsonBody);
+        // 创建JSON类型的请求体
+        MediaType JSON = MediaType.parse("application/json; charset=utf-8");
+        RequestBody requestBody = RequestBody.create(JSON, jsonString);
+
+        Request request = new Request.Builder()
+                .url(UPLOAD_URL)
+                .post(requestBody)
+                .addHeader("User-Agent", "ScreenCaptureApp/1.0")
+                .addHeader("Content-Type", "application/json")
                 .build();
 
         try (Response response = client.newCall(request).execute()) {
