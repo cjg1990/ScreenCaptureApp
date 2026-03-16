@@ -5,7 +5,7 @@
     android:layout_height="wrap_content"
     android:orientation="vertical"
     android:background="#80000000"
-    android:padding="8dp">
+    android:padding="5dp">
 
     <TextView
         android:id="@+id/tv_feedback"
@@ -14,12 +14,5 @@
         android:text="等待反馈..."
         android:textColor="#FFFFFF"
         android:textSize="14sp" />
-
-    <Button
-        android:id="@+id/btn_close"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:text="关闭"
-        android:layout_marginTop="8dp"/>
 
 </LinearLayout>

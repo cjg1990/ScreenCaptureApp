@@ -29,6 +29,9 @@ import androidx.core.content.ContextCompat;
 
 import com.example.screencaptureapp.utils.PermissionHelper;
 
+import java.util.ArrayList;
+import java.util.List;
+
 public class MainActivity extends AppCompatActivity {
     private static final int REQUEST_CODE_SCREEN_CAPTURE = 1001;
     private static final int REQUEST_OVERLAY_PERMISSION = 1002;
@@ -61,11 +64,6 @@ public class MainActivity extends AppCompatActivity {
         super.onCreate(savedInstanceState);
         EdgeToEdge.enable(this);
         setContentView(R.layout.activity_main);
-        /*ViewCompat.setOnApplyWindowInsetsListener(findViewById(R.id.main), (v, insets) -> {
-            Insets systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars());
-            v.setPadding(systemBars.left, systemBars.top, systemBars.right, systemBars.bottom);
-            return insets;
-        });*/
 
         initViews();
         checkPermissions();
@@ -109,12 +107,26 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void checkPermissions() {
-        String[] permissions = {
+        /*String[] permissions = {
                 Manifest.permission.RECORD_AUDIO,
                 Manifest.permission.INTERNET,
                 Manifest.permission.ACCESS_NETWORK_STATE
-        };
+        };*/
+        List<String> permissionList = new ArrayList<>();
+        //permissionList.add(Manifest.permission.RECORD_AUDIO);
+        permissionList.add(Manifest.permission.INTERNET);
+        permissionList.add(Manifest.permission.ACCESS_NETWORK_STATE);
 
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            // Android 13+ (API 33+)
+            permissionList.add(Manifest.permission.READ_MEDIA_IMAGES);
+        } else {
+            // Android 12 及以下
+            permissionList.add(Manifest.permission.READ_EXTERNAL_STORAGE);
+            permissionList.add(Manifest.permission.WRITE_EXTERNAL_STORAGE);
+        }
+
+        String[] permissions = permissionList.toArray(new String[0]);
         if (!PermissionHelper.hasPermissions(this, permissions)) {
             ActivityCompat.requestPermissions(this, permissions, REQUEST_PERMISSIONS);
         }
@@ -130,16 +142,6 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void startScreenCapture() {
-        /*if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForegroundService(new Intent(this, ScreenCaptureService.class));
-        } else {
-            startService(new Intent(this, ScreenCaptureService.class));
-        }
-        bindService(new Intent(this, ScreenCaptureService.class),
-                serviceConnection, BIND_AUTO_CREATE);
-
-        Intent captureIntent = mediaProjectionManager.createScreenCaptureIntent();
-        startActivityForResult(captureIntent, REQUEST_CODE_SCREEN_CAPTURE);*/
         // 检查是否已授予媒体投影权限
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (ContextCompat.checkSelfPermission(this,
@@ -181,6 +183,13 @@ public class MainActivity extends AppCompatActivity {
 
         if (requestCode == REQUEST_CODE_SCREEN_CAPTURE) {
             if (resultCode == Activity.RESULT_OK && isServiceBound) {
+                Intent intent = new Intent(this, FloatingWindowService.class);
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    startForegroundService(intent);
+                } else {
+                    startService(intent);
+                }
+
                 screenCaptureService.startRecording(resultCode, data);
                 statusText.setText("录制中...");
                 updateUI();

@@ -6,11 +6,13 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!--uses-permission android:name="android.permission.RECORD_AUDIO" /-->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <!-- 屏幕录制权限 -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="28" />
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
 
     <!-- 如果目标SDK >= 34，还需要声明这个权限 -->
     <uses-permission android:name="android.permission.CAPTURE_VIDEO_OUTPUT"
@@ -27,6 +29,7 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.ScreenCaptureApp"
         android:usesCleartextTraffic="true"
+        android:requestLegacyExternalStorage="true"
         tools:targetApi="33"
         tools:ignore="UnusedAttribute">
         <activity
@@ -47,9 +50,15 @@
             android:enabled="true"
             android:permission="android.permission.BIND_JOB_SERVICE" />
 
+        <!--service
+            android:name=".FloatingWindowService"
+            android:exported="false" / -->
         <service
             android:name=".FloatingWindowService"
-            android:exported="false" />
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="specialUse" />
+
 
         <!-- 悬浮窗权限 -->
         <uses-library android:name="android.test.runner" />

@@ -1,7 +1,9 @@
 package com.example.screencaptureapp;
 
 import android.app.Service;
+import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.graphics.PixelFormat;
 import android.os.Build;
 import android.os.Handler;
@@ -17,11 +19,15 @@ import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import androidx.core.app.NotificationCompat;
+import android.content.BroadcastReceiver;
 
 public class FloatingWindowService extends Service {
 
     public static final String ACTION_UPDATE_TEXT = "UPDATE_TEXT";
     public static final String EXTRA_TEXT = "text";
+    public static final String ACTION_HIDE_WINDOW = "HIDE_WINDOW";
+    public static final String ACTION_SHOW_WINDOW = "SHOW_WINDOW";
+    //private WindowManager.LayoutParams currentParams; // 存储参数以供重新添加时使用
 
     private static final String TAG = "FloatingWindowService";
     private static final String CHANNEL_ID = "floating_window_channel";
@@ -32,6 +38,29 @@ public class FloatingWindowService extends Service {
     private TextView feedbackText;
     private Handler handler;
 
+    // 接收悬浮窗更新的广播
+    private final BroadcastReceiver updateReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (ACTION_UPDATE_TEXT.equals(intent.getAction())) {
+                String text = intent.getStringExtra(EXTRA_TEXT);
+                if (text != null) {
+                    updateFeedbackText(text);
+                }
+            }
+            else if(ACTION_HIDE_WINDOW.equals(intent.getAction())) {
+                if (floatingView != null ) {
+                    floatingView.setVisibility(View.INVISIBLE);
+                }
+            }
+            else if(ACTION_SHOW_WINDOW.equals(intent.getAction())) {
+                if (floatingView != null) {
+                    floatingView.setVisibility(View.VISIBLE);
+                }
+            }
+        }
+    };
+
     @Override
     public void onCreate() {
         super.onCreate();
@@ -40,6 +69,18 @@ public class FloatingWindowService extends Service {
         windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
         handler = new Handler(getMainLooper());
         createNotificationChannel();
+
+        // 注册广播接收器
+        //IntentFilter filter = new IntentFilter(ACTION_UPDATE_TEXT);
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(ACTION_UPDATE_TEXT);
+        filter.addAction(ACTION_HIDE_WINDOW);
+        filter.addAction(ACTION_SHOW_WINDOW);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(updateReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+        } else {
+            registerReceiver(updateReceiver, filter);
+        }
     }
 
     @Override
@@ -54,7 +95,7 @@ public class FloatingWindowService extends Service {
             startForeground(NOTIFICATION_ID, notification);
         }
 
-        if (intent != null) {
+        /*if (intent != null) {
             String action = intent.getAction();
             if (ACTION_UPDATE_TEXT.equals(action)) {
                 String text = intent.getStringExtra(EXTRA_TEXT);
@@ -62,7 +103,7 @@ public class FloatingWindowService extends Service {
                     updateFeedbackText(text);
                 }
             }
-        }
+        }*/
 
         if (floatingView == null) {
             createFloatingWindow();
@@ -92,6 +133,7 @@ public class FloatingWindowService extends Service {
         params.gravity = Gravity.TOP | Gravity.END;
         params.x = 20;
         params.y = 100;
+        params.windowAnimations = 0;
 
         try {
             windowManager.addView(floatingView, params);
@@ -101,13 +143,13 @@ public class FloatingWindowService extends Service {
             Log.e(TAG, "Error creating floating window: " + e.getMessage());
         }
 
-        floatingView.findViewById(R.id.btn_close).setOnClickListener(v -> stopSelf());
+        //floatingView.findViewById(R.id.btn_close).setOnClickListener(v -> stopSelf());
     }
 
     private void updateFeedbackText(final String text) {
         handler.post(() -> {
             if (feedbackText != null) {
-                feedbackText.setText("反馈: " + text);
+                feedbackText.setText(text);
             }
         });
     }
@@ -138,6 +180,11 @@ public class FloatingWindowService extends Service {
     @Override
     public void onDestroy() {
         super.onDestroy();
+        try {
+            unregisterReceiver(updateReceiver);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
         if (floatingView != null && windowManager != null) {
             windowManager.removeView(floatingView);
         }

@@ -25,6 +25,7 @@ import java.nio.ByteBuffer;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.LinkedBlockingQueue;
 
 public class ScreenCaptureService extends Service {
 
@@ -37,22 +38,32 @@ public class ScreenCaptureService extends Service {
     private ImageReader imageReader;
     private HandlerThread handlerThread;
     private Handler handler;
-    private ExecutorService executorService;
+    //private ExecutorService executorService;
 
     private int screenDensity;
     private int screenWidth;
     private int screenHeight;
 
-    private boolean isRecording = false;
+    private volatile boolean isRecording = false;
     private int frameRate = 1; // 每秒1帧，可调整
     private long lastCaptureTime = 0;
+    private static final long CAPTURE_INTERVAL_MS = 2000;
+    private LinkedBlockingQueue<Bitmap> frameQueue;
+    private Thread uploadThread;
 
     // 使用原子布尔值确保线程安全
-    private final AtomicBoolean isProcessing = new AtomicBoolean(false);
+    //private final AtomicBoolean isProcessing = new AtomicBoolean(false);
     private final AtomicBoolean isStopping = new AtomicBoolean(false);
 
     private final IBinder binder = new LocalBinder();
     private NetworkManager networkManager;
+
+    // todo 1 start
+    private Thread captureControlThread;
+    private final Object captureLock = new Object();
+    private volatile boolean requestCleanFrame = false;
+    private Bitmap latestCleanBitmap = null; // 暂存采集窗口期内的最新帧
+    // todo 1 end
 
     public class LocalBinder extends Binder {
         ScreenCaptureService getService() {
@@ -64,8 +75,6 @@ public class ScreenCaptureService extends Service {
     public void onCreate() {
         super.onCreate();
         createNotificationChannel();
-        //executorService = Executors.newSingleThreadExecutor();
-        //networkManager = new NetworkManager(this);
 
         DisplayMetrics metrics = getResources().getDisplayMetrics();
         screenDensity = metrics.densityDpi;
@@ -101,13 +110,13 @@ public class ScreenCaptureService extends Service {
     public void startRecording(int resultCode, Intent data) {
         if (isRecording) return;
         // 修改：在开始录制时初始化线程池
-        if (executorService == null || executorService.isShutdown() || executorService.isTerminated()) {
+        /*if (executorService == null || executorService.isShutdown() || executorService.isTerminated()) {
             executorService = Executors.newSingleThreadExecutor(r -> {
                 Thread thread = new Thread(r, "ImageProcessor");
                 thread.setPriority(Thread.MIN_PRIORITY);
                 return thread;
             });
-        }
+        }*/
 
         // 修改：在开始录制时初始化 NetworkManager
         if (networkManager == null) {
@@ -122,7 +131,6 @@ public class ScreenCaptureService extends Service {
             Log.e(TAG, "MediaProjection is null");
             return;
         }
-
         // 重置停止标志
         isStopping.set(false);
 
@@ -132,12 +140,53 @@ public class ScreenCaptureService extends Service {
         setupImageReader();
         createVirtualDisplay();
 
-        //mediaProjection.registerCallback(mediaProjectionCallback, handler);
         isRecording = true;
-        startImageCaptureLoop();
 
-        //updateNotification("正在录制屏幕");
+        frameQueue = new LinkedBlockingQueue<>(3);
+        startUploadConsumerThread();
+        //startImageCaptureLoop();
+
+        // todo 2 start
+        startCaptureControlThread();
+        // todo 2 end
     }
+
+    // todo 3 start
+    private void startCaptureControlThread() {
+        captureControlThread = new Thread(() -> {
+            while(isRecording && !Thread.currentThread().isInterrupted()) {
+                try {
+                    synchronized (captureLock) {
+                        requestCleanFrame = true;
+                        latestCleanBitmap = null;
+                    }
+
+                    sendBroadcast(new Intent(FloatingWindowService.ACTION_HIDE_WINDOW));
+
+                    Thread.sleep(1000);
+
+                    synchronized (captureLock) {
+                        requestCleanFrame = false;
+                        if(latestCleanBitmap != null) {
+                            frameQueue.clear();
+                            frameQueue.offer(latestCleanBitmap);
+                        }
+                    }
+
+                    sendBroadcast(new Intent(FloatingWindowService.ACTION_SHOW_WINDOW));
+
+                    Thread.sleep(1000);
+                }
+                catch (InterruptedException e)
+                {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        }, "CaptureControlThread");
+        captureControlThread.start();
+    }
+    // todo 3 end
 
     private void setupImageReader() {
         imageReader = ImageReader.newInstance(
@@ -171,15 +220,113 @@ public class ScreenCaptureService extends Service {
                     if (isStopping.get()) {
                         return;
                     }
-                    Image image = reader.acquireLatestImage();
+                    /*Image image = reader.acquireLatestImage();
                     if (image != null) {
                         processImage(image);
+                        image.close();
+                    }*/
+                    Image image = reader.acquireLatestImage();
+                    if(image != null)
+                    {
+                        // todo 4 start
+                        /*long currentTime = System.currentTimeMillis();
+                        if(currentTime - lastCaptureTime >= CAPTURE_INTERVAL_MS)
+                        {
+                            lastCaptureTime = currentTime;
+                            processAndQueueImage(image);
+                        }
+                        image.close();*/
+                        // todo 4 end
+
+                        synchronized (captureLock) {
+                            if(requestCleanFrame) {
+                                Bitmap bitmap = convertImageToBitmap(image);
+                                if(bitmap != null) {
+                                    if(latestCleanBitmap != null && !latestCleanBitmap.isRecycled())
+                                    {
+                                        latestCleanBitmap.recycle();
+                                    }
+                                    latestCleanBitmap = bitmap;
+                                }
+                            }
+                        }
                         image.close();
                     }
                 }
             };
 
-    private void processImage(Image image) {
+    // todo 5 start
+    private Bitmap convertImageToBitmap(Image image) {
+        try {
+            Image.Plane[] planes = image.getPlanes();
+            ByteBuffer buffer = planes[0].getBuffer();
+            int pixelStride = planes[0].getPixelStride();
+            int rowStride = planes[0].getRowStride();
+            int rowPadding = rowStride - pixelStride * screenWidth;
+
+            Bitmap bitmap = Bitmap.createBitmap(
+                    screenWidth + rowPadding / pixelStride,
+                    screenHeight,
+                    Bitmap.Config.ARGB_8888
+            );
+
+            bitmap.copyPixelsFromBuffer(buffer);
+
+            // 裁剪掉填充部分
+            Bitmap croppedBitmap = Bitmap.createBitmap(
+                    bitmap,
+                    0,
+                    0,
+                    screenWidth,
+                    screenHeight
+            );
+            bitmap.recycle();
+
+            return croppedBitmap;
+        } catch (Exception e)
+        {
+            Log.e(TAG, "Error convertImageToBitmap: " + e.getMessage());
+        }
+        return null;
+    }
+    // todo 5 end
+
+    private void processAndQueueImage(Image image) {
+        try {
+            Image.Plane[] planes = image.getPlanes();
+            ByteBuffer buffer = planes[0].getBuffer();
+            int pixelStride = planes[0].getPixelStride();
+            int rowStride = planes[0].getRowStride();
+            int rowPadding = rowStride - pixelStride * screenWidth;
+
+            Bitmap bitmap = Bitmap.createBitmap(
+                    screenWidth + rowPadding / pixelStride,
+                    screenHeight,
+                    Bitmap.Config.ARGB_8888
+            );
+
+            bitmap.copyPixelsFromBuffer(buffer);
+
+            // 裁剪掉填充部分
+            Bitmap croppedBitmap = Bitmap.createBitmap(
+                    bitmap,
+                    0,
+                    0,
+                    screenWidth,
+                    screenHeight
+            );
+            bitmap.recycle();
+
+            if(!frameQueue.offer(croppedBitmap)) {
+                croppedBitmap.recycle();
+                Log.d(TAG, "Network is slow, queue is full, dropping frame");
+            }
+        } catch (Exception e)
+        {
+            Log.e(TAG, "Error processing image: " + e.getMessage());
+        }
+    }
+    /*private void processImage(Image image) {
         // 检查是否正在处理或正在停止
         if (isProcessing.get() || isStopping.get()) {
             return;
@@ -220,9 +367,56 @@ public class ScreenCaptureService extends Service {
         } finally {
             isProcessing.set(false);
         }
+    }*/
+
+    private void startUploadConsumerThread() {
+        uploadThread = new Thread(() -> {
+            Log.e(TAG, "Upload Thread is running..");
+            while(isRecording && !Thread.currentThread().isInterrupted())
+            {
+                try{
+                    Bitmap bitmap = frameQueue.take();
+
+                    if(bitmap != null)
+                    {
+                        Log.e(TAG, "now send image..");
+                        try {
+                            String response = networkManager.uploadImage(bitmap);
+                            updateFloatingWindow(response);
+                        } catch (Exception e)
+                        {
+                            Log.e(TAG, "Error uploading image: " + e.getMessage());
+                            updateFloatingWindow("上传失败: " + e.getMessage());
+                        } finally {
+                            if(!bitmap.isRecycled())
+                            {
+                                bitmap.recycle();
+                            }
+                        }
+                    }
+                } catch (InterruptedException e)
+                {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+                catch (Throwable t) {
+                    // 【核心修改】捕获 Throwable 而不是 Exception！
+                    // 如果是缺依赖、OOM 等致命 Error，这里会立刻打印出来！
+                    Log.e(TAG, "!!!! FATAL ERROR, Upload Thread !!!!", t);
+                }
+            }
+            Log.e(TAG, "==== upload thread terminate ====");
+        }, "NetworkUploadThread");
+        uploadThread.start();
     }
 
-    private void sendImageToServer(Bitmap bitmap) {
+    private void updateFloatingWindow(String text) {
+        Intent intent = new Intent(FloatingWindowService.ACTION_UPDATE_TEXT);
+        intent.putExtra(FloatingWindowService.EXTRA_TEXT, text);
+        sendBroadcast(intent);
+    }
+
+    /*private void sendImageToServer(Bitmap bitmap) {
         // 修改：检查线程池是否已关闭
         if (executorService == null || executorService.isShutdown() || executorService.isTerminated()) {
             Log.w(TAG, "ExecutorService is not available, skipping image upload");
@@ -263,9 +457,9 @@ public class ScreenCaptureService extends Service {
                 bitmap.recycle();
             }
         }
-    }
+    }*/
 
-    private void startImageCaptureLoop() {
+    /*private void startImageCaptureLoop() {
         handler.postDelayed(new Runnable() {
             @Override
             public void run() {
@@ -283,7 +477,6 @@ public class ScreenCaptureService extends Service {
                             });
                         }
                     }
-                    //handler.postDelayed(this, 1000 / frameRate);
                     // 继续循环
                     if (isRecording && !isStopping.get()) {
                         handler.postDelayed(this, 1000 / frameRate);
@@ -291,7 +484,7 @@ public class ScreenCaptureService extends Service {
                 }
             }
         }, 1000 / frameRate);
-    }
+    }*/
 
     public void stopRecording() {
         if (!isRecording || isStopping.get()) {
@@ -299,6 +492,32 @@ public class ScreenCaptureService extends Service {
         }
         isStopping.set(true);
         isRecording = false;
+
+        if(captureControlThread != null) {
+            captureControlThread.interrupt();
+            captureControlThread = null;
+        }
+        // 停止消费者线程
+        if (uploadThread != null) {
+            uploadThread.interrupt();
+            uploadThread = null;
+        }
+
+        if(latestCleanBitmap != null && !latestCleanBitmap.isRecycled())
+        {
+            latestCleanBitmap.recycle();
+            latestCleanBitmap = null;
+        }
+        requestCleanFrame = false;
+
+        // 清空队列，释放未处理的 Bitmap 防止内存泄漏
+        if (frameQueue != null) {
+            while (!frameQueue.isEmpty()) {
+                Bitmap b = frameQueue.poll();
+                if (b != null && !b.isRecycled()) b.recycle();
+            }
+            frameQueue.clear();
+        }
 
         // 移除所有未执行的回调
         if (handler != null) {
@@ -324,7 +543,7 @@ public class ScreenCaptureService extends Service {
             handlerThread.quitSafely();
         }
         // 修改：正确关闭线程池
-        if (executorService != null) {
+        /*if (executorService != null) {
             try {
                 // 停止接受新任务
                 executorService.shutdown();
@@ -340,7 +559,7 @@ public class ScreenCaptureService extends Service {
             } finally {
                 executorService = null;
             }
-        }
+        }*/
 
         // 修改：清理 networkManager
         if (networkManager != null) {
@@ -348,8 +567,6 @@ public class ScreenCaptureService extends Service {
         }
 
         isStopping.set(false);
-        //executorService.shutdown();
-        //updateNotification("录制已停止");
     }
 
     private final MediaProjection.Callback mediaProjectionCallback =
@@ -382,18 +599,6 @@ public class ScreenCaptureService extends Service {
                 .setPriority(NotificationCompat.PRIORITY_LOW)
                 .build();
     }
-
-    /*private void updateNotification(String text) {
-        Notification notification = new NotificationCompat.Builder(this, CHANNEL_ID)
-                .setContentTitle("屏幕录制服务")
-                .setContentText(text)
-                .setSmallIcon(R.drawable.ic_notification)
-                .setPriority(NotificationCompat.PRIORITY_LOW)
-                .build();
-
-        NotificationManager manager = getSystemService(NotificationManager.class);
-        manager.notify(NOTIFICATION_ID, notification);
-    }*/
 
     @Nullable
     @Override
