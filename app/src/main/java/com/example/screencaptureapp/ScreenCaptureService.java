@@ -4,8 +4,10 @@ import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Service;
+import android.content.Context;
 import android.content.Intent;
 import android.graphics.Bitmap;
+import android.graphics.Rect;
 import android.hardware.display.DisplayManager;
 import android.hardware.display.VirtualDisplay;
 import android.media.Image;
@@ -26,9 +28,10 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.LinkedBlockingQueue;
+import android.view.WindowManager;
+import android.view.WindowMetrics;
 
 public class ScreenCaptureService extends Service {
-
     private static final String TAG = "ScreenCaptureService";
     private static final String CHANNEL_ID = "screen_capture_channel";
     private static final int NOTIFICATION_ID = 1001;
@@ -48,7 +51,8 @@ public class ScreenCaptureService extends Service {
     private int frameRate = 1; // 每秒1帧，可调整
     private long lastCaptureTime = 0;
     private static final long CAPTURE_INTERVAL_MS = 2000;
-    private LinkedBlockingQueue<Bitmap> frameQueue;
+    //private LinkedBlockingQueue<Bitmap> frameQueue;
+    private LinkedBlockingQueue<CaptureFrame> frameQueue;
     private Thread uploadThread;
 
     // 使用原子布尔值确保线程安全
@@ -62,8 +66,30 @@ public class ScreenCaptureService extends Service {
     private Thread captureControlThread;
     private final Object captureLock = new Object();
     private volatile boolean requestCleanFrame = false;
-    private Bitmap latestCleanBitmap = null; // 暂存采集窗口期内的最新帧
+    //private Bitmap latestCleanBitmap = null; // 暂存采集窗口期内的最新帧
+    private CaptureFrame latestCleanFrame = null;
     // todo 1 end
+
+    // 新增：用于缓存纯像素数据的复用数组，避免频繁创建对象
+    // 2026/6/4
+    private byte[] pixelDataBuffer;
+    private int cachedPixelStride;
+    private int cachedRowStride;
+    private long latestFrameTimestamp;
+    private volatile boolean hasNewFrame = false;
+    // 2026/6/4
+
+    // 2026/6/3 start
+    public static class CaptureFrame {
+        public final Bitmap bitmap;
+        public final long captureTimeMs; // 截取该帧的具体时间戳(毫秒)
+
+        public CaptureFrame(Bitmap bitmap, long captureTimeMs) {
+            this.bitmap = bitmap;
+            this.captureTimeMs = captureTimeMs;
+        }
+    }
+    // 2026/6/3 end
 
     public class LocalBinder extends Binder {
         ScreenCaptureService getService() {
@@ -76,14 +102,45 @@ public class ScreenCaptureService extends Service {
         super.onCreate();
         createNotificationChannel();
 
-        DisplayMetrics metrics = getResources().getDisplayMetrics();
+        // 2026/6/4
+        /*DisplayMetrics metrics = getResources().getDisplayMetrics();
         screenDensity = metrics.densityDpi;
         screenWidth = metrics.widthPixels;
-        screenHeight = metrics.heightPixels;
+        screenHeight = metrics.heightPixels;*/
+        updateScreenDimensions();
+        // 2026/6/4
 
         handlerThread = new HandlerThread("ScreenCapture");
         handlerThread.start();
         handler = new Handler(handlerThread.getLooper());
+    }
+
+    /**
+     * 核心修复方法：获取包含状态栏、导航栏、挖孔区的全屏真实物理分辨率
+     */
+    private void updateScreenDimensions() {
+        WindowManager windowManager = (WindowManager) getSystemService(Context.WINDOW_SERVICE);
+        // 【新增校验】如果获取不到 WindowManager，直接抛出异常让 App 崩溃并停止运行
+        if (windowManager == null) {
+            throw new IllegalStateException("Critical Error: WindowManager is null. Cannot retrieve screen dimensions. Terminating application.");
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            // Android 11+ 标准物理屏幕区域获取
+            WindowMetrics windowMetrics = windowManager.getMaximumWindowMetrics();
+            Rect bounds = windowMetrics.getBounds();
+            screenWidth = bounds.width();
+            screenHeight = bounds.height();
+            screenDensity = getResources().getConfiguration().densityDpi;
+        } else {
+            // Android 11 以下利用反射/真实指标接口获取
+            DisplayMetrics realMetrics = new DisplayMetrics();
+            windowManager.getDefaultDisplay().getRealMetrics(realMetrics);
+            screenWidth = realMetrics.widthPixels;
+            screenHeight = realMetrics.heightPixels;
+            screenDensity = realMetrics.densityDpi;
+        }
+        Log.d(TAG, "更新全屏真实分辨率: " + screenWidth + "x" + screenHeight + ", 密度: " + screenDensity);
     }
 
     @Override
@@ -118,6 +175,10 @@ public class ScreenCaptureService extends Service {
             });
         }*/
 
+        // 2026/6/4
+        updateScreenDimensions();
+        // 2026/6/4
+
         // 修改：在开始录制时初始化 NetworkManager
         if (networkManager == null) {
             networkManager = new NetworkManager(this);
@@ -151,14 +212,17 @@ public class ScreenCaptureService extends Service {
         // todo 2 end
     }
 
-    // todo 3 start
-    private void startCaptureControlThread() {
+    // 2026/6/4
+    /*private void startCaptureControlThread() {
         captureControlThread = new Thread(() -> {
             while(isRecording && !Thread.currentThread().isInterrupted()) {
                 try {
                     synchronized (captureLock) {
                         requestCleanFrame = true;
-                        latestCleanBitmap = null;
+                        //latestCleanBitmap = null;
+                        // 2026/6/3 start
+                        latestCleanFrame = null;
+                        // 2026/6/3 end
                     }
 
                     sendBroadcast(new Intent(FloatingWindowService.ACTION_HIDE_WINDOW));
@@ -167,10 +231,21 @@ public class ScreenCaptureService extends Service {
 
                     synchronized (captureLock) {
                         requestCleanFrame = false;
-                        if(latestCleanBitmap != null) {
-                            frameQueue.clear();
-                            frameQueue.offer(latestCleanBitmap);
+                        // 2026/6/3 start
+                        //if(latestCleanBitmap != null) {
+                       //     frameQueue.clear();
+                       //     frameQueue.offer(latestCleanBitmap);
+                        //}
+                        if(latestCleanFrame != null) {
+                            while(!frameQueue.isEmpty()) {
+                                CaptureFrame oldFrame = frameQueue.poll();
+                                if(oldFrame != null && oldFrame.bitmap != null && !oldFrame.bitmap.isRecycled()) {
+                                    oldFrame.bitmap.recycle();
+                                }
+                            }
+                            frameQueue.offer(latestCleanFrame);
                         }
+                        // 2026/6/3 end
                     }
 
                     sendBroadcast(new Intent(FloatingWindowService.ACTION_SHOW_WINDOW));
@@ -185,8 +260,68 @@ public class ScreenCaptureService extends Service {
             }
         }, "CaptureControlThread");
         captureControlThread.start();
+    }*/
+    // 2026/6/4
+    private void startCaptureControlThread() {
+        captureControlThread = new Thread(() -> {
+            while(isRecording && !Thread.currentThread().isInterrupted()) {
+                try {
+                    // --- 1. 开启采集窗口 ---
+                    synchronized (captureLock) {
+                        requestCleanFrame = true;
+                        hasNewFrame = false; // 重置新帧标记
+                    }
+
+                    sendBroadcast(new Intent(FloatingWindowService.ACTION_HIDE_WINDOW));
+
+                    // 悬浮窗隐藏并等待画面采集
+                    Thread.sleep(500);
+
+                    // --- 2. 结束采集窗口，获取最终参数 ---
+                    boolean shouldConvert = false;
+                    long timestamp = 0;
+                    int pStride = 0, rStride = 0;
+
+                    synchronized (captureLock) {
+                        requestCleanFrame = false;
+                        if (hasNewFrame && pixelDataBuffer != null) {
+                            shouldConvert = true;
+                            timestamp = latestFrameTimestamp;
+                            pStride = cachedPixelStride;
+                            rStride = cachedRowStride;
+                        }
+                    }
+
+                    // --- 3. 在锁外执行唯一一次耗时的 Bitmap 转换 ---
+                    if (shouldConvert) {
+                        Bitmap bitmap = buildBitmapFromBuffer(pixelDataBuffer, pStride, rStride);
+                        if (bitmap != null) {
+                            CaptureFrame newFrame = new CaptureFrame(bitmap, timestamp);
+
+                            // 清理队列中的旧帧，防止内存泄漏
+                            while(!frameQueue.isEmpty()) {
+                                CaptureFrame oldFrame = frameQueue.poll();
+                                if(oldFrame != null && oldFrame.bitmap != null && !oldFrame.bitmap.isRecycled()) {
+                                    oldFrame.bitmap.recycle();
+                                }
+                            }
+                            frameQueue.offer(newFrame);
+                        }
+                    }
+
+                    // --- 4. 恢复悬浮窗并进入休息期 ---
+                    sendBroadcast(new Intent(FloatingWindowService.ACTION_SHOW_WINDOW));
+                    Thread.sleep(500);
+
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        }, "CaptureControlThread");
+        captureControlThread.start();
     }
-    // todo 3 end
+    // 2026/6/4
 
     private void setupImageReader() {
         imageReader = ImageReader.newInstance(
@@ -211,8 +346,8 @@ public class ScreenCaptureService extends Service {
                 handler
         );
     }
-
-    private final ImageReader.OnImageAvailableListener imageAvailableListener =
+    // 2026/6/4
+    /*private final ImageReader.OnImageAvailableListener imageAvailableListener =
             new ImageReader.OnImageAvailableListener() {
                 @Override
                 public void onImageAvailable(ImageReader reader) {
@@ -220,40 +355,96 @@ public class ScreenCaptureService extends Service {
                     if (isStopping.get()) {
                         return;
                     }
-                    /*Image image = reader.acquireLatestImage();
-                    if (image != null) {
-                        processImage(image);
-                        image.close();
-                    }*/
                     Image image = reader.acquireLatestImage();
                     if(image != null)
                     {
-                        // todo 4 start
-                        /*long currentTime = System.currentTimeMillis();
-                        if(currentTime - lastCaptureTime >= CAPTURE_INTERVAL_MS)
-                        {
-                            lastCaptureTime = currentTime;
-                            processAndQueueImage(image);
-                        }
-                        image.close();*/
-                        // todo 4 end
+                        long captureTimeMs = System.currentTimeMillis();
 
                         synchronized (captureLock) {
                             if(requestCleanFrame) {
                                 Bitmap bitmap = convertImageToBitmap(image);
                                 if(bitmap != null) {
-                                    if(latestCleanBitmap != null && !latestCleanBitmap.isRecycled())
+                                    //if(latestCleanBitmap != null && !latestCleanBitmap.isRecycled())
+                                    //{
+                                    //    latestCleanBitmap.recycle();
+                                    //}
+                                    //latestCleanBitmap = bitmap;
+                                    if(latestCleanFrame != null && latestCleanFrame.bitmap != null && !latestCleanFrame.bitmap.isRecycled())
                                     {
-                                        latestCleanBitmap.recycle();
+                                        latestCleanFrame.bitmap.recycle();
                                     }
-                                    latestCleanBitmap = bitmap;
+                                    latestCleanFrame = new CaptureFrame(bitmap, captureTimeMs);
                                 }
                             }
                         }
                         image.close();
                     }
                 }
+            };*/
+    // 2026/6/4
+    private final ImageReader.OnImageAvailableListener imageAvailableListener =
+            new ImageReader.OnImageAvailableListener() {
+                @Override
+                public void onImageAvailable(ImageReader reader) {
+                    if (isStopping.get()) return;
+
+                    Image image = reader.acquireLatestImage();
+                    if (image != null) {
+                        synchronized (captureLock) {
+                            if (requestCleanFrame) {
+                                try {
+                                    Image.Plane[] planes = image.getPlanes();
+                                    ByteBuffer buffer = planes[0].getBuffer();
+                                    int remaining = buffer.remaining();
+
+                                    // 如果数组未初始化或容量变化，才重新分配
+                                    if (pixelDataBuffer == null || pixelDataBuffer.length != remaining) {
+                                        pixelDataBuffer = new byte[remaining];
+                                    }
+
+                                    buffer.position(0);
+                                    buffer.get(pixelDataBuffer); // 毫秒级的极速拷贝
+
+                                    cachedPixelStride = planes[0].getPixelStride();
+                                    cachedRowStride = planes[0].getRowStride();
+                                    latestFrameTimestamp = System.currentTimeMillis();
+                                    hasNewFrame = true;
+                                } catch (Exception e) {
+                                    Log.e(TAG, "Error copying pixels: " + e.getMessage());
+                                }
+                            }
+                        }
+                        // 无论是否采纳，必须极速释放 Image，防止底层阻塞
+                        image.close();
+                    }
+                }
             };
+    //2026/6/4
+    private Bitmap buildBitmapFromBuffer(byte[] pixels, int pixelStride, int rowStride) {
+        try {
+            int rowPadding = rowStride - pixelStride * screenWidth;
+            Bitmap bitmap = Bitmap.createBitmap(
+                    screenWidth + rowPadding / pixelStride,
+                    screenHeight,
+                    Bitmap.Config.ARGB_8888
+            );
+            bitmap.copyPixelsFromBuffer(ByteBuffer.wrap(pixels));
+
+            Bitmap croppedBitmap = Bitmap.createBitmap(
+                    bitmap,
+                    0,
+                    0,
+                    screenWidth,
+                    screenHeight
+            );
+            bitmap.recycle();
+            return croppedBitmap;
+        } catch (Exception e) {
+            Log.e(TAG, "Error building bitmap: " + e.getMessage());
+            return null;
+        }
+    }
+    //2026/6/4
 
     // todo 5 start
     private Bitmap convertImageToBitmap(Image image) {
@@ -291,7 +482,7 @@ public class ScreenCaptureService extends Service {
     }
     // todo 5 end
 
-    private void processAndQueueImage(Image image) {
+    /*private void processAndQueueImage(Image image) {
         try {
             Image.Plane[] planes = image.getPlanes();
             ByteBuffer buffer = planes[0].getBuffer();
@@ -325,7 +516,7 @@ public class ScreenCaptureService extends Service {
         {
             Log.e(TAG, "Error processing image: " + e.getMessage());
         }
-    }
+    }*/
     /*private void processImage(Image image) {
         // 检查是否正在处理或正在停止
         if (isProcessing.get() || isStopping.get()) {
@@ -375,13 +566,17 @@ public class ScreenCaptureService extends Service {
             while(isRecording && !Thread.currentThread().isInterrupted())
             {
                 try{
-                    Bitmap bitmap = frameQueue.take();
+                    //Bitmap bitmap = frameQueue.take();
+                    CaptureFrame frame = frameQueue.take();
 
-                    if(bitmap != null)
+                    if(frame != null && frame.bitmap != null)
                     {
+                        Bitmap bitmap = frame.bitmap;
+                        long timestamp = frame.captureTimeMs; // 获取截取这帧时的精准时间戳
+
                         Log.e(TAG, "now send image..");
                         try {
-                            String response = networkManager.uploadImage(bitmap);
+                            String response = networkManager.uploadImage(bitmap,timestamp);
                             updateFloatingWindow(response);
                         } catch (Exception e)
                         {
@@ -503,18 +698,34 @@ public class ScreenCaptureService extends Service {
             uploadThread = null;
         }
 
-        if(latestCleanBitmap != null && !latestCleanBitmap.isRecycled())
+        /*if(latestCleanBitmap != null && !latestCleanBitmap.isRecycled())
         {
             latestCleanBitmap.recycle();
             latestCleanBitmap = null;
+        }*/
+        // 【修改】清理 latestCleanFrame
+        if(latestCleanFrame != null && latestCleanFrame.bitmap != null && !latestCleanFrame.bitmap.isRecycled())
+        {
+            latestCleanFrame.bitmap.recycle();
+            latestCleanFrame = null;
         }
         requestCleanFrame = false;
 
         // 清空队列，释放未处理的 Bitmap 防止内存泄漏
-        if (frameQueue != null) {
+        /*if (frameQueue != null) {
             while (!frameQueue.isEmpty()) {
                 Bitmap b = frameQueue.poll();
                 if (b != null && !b.isRecycled()) b.recycle();
+            }
+            frameQueue.clear();
+        }*/
+        // 清空队列，释放未处理的 Bitmap 防止内存泄漏
+        if (frameQueue != null) {
+            while (!frameQueue.isEmpty()) {
+                CaptureFrame f = frameQueue.poll();
+                if (f != null && f.bitmap != null && !f.bitmap.isRecycled()) {
+                    f.bitmap.recycle();
+                }
             }
             frameQueue.clear();
         }
@@ -565,7 +776,9 @@ public class ScreenCaptureService extends Service {
         if (networkManager != null) {
             networkManager = null;
         }
-
+        // 2026/6/4
+        pixelDataBuffer = null;
+        // 2026/6/4
         isStopping.set(false);
     }
 

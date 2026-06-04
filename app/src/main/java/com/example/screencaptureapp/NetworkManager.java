@@ -35,10 +35,14 @@ public class NetworkManager {
 
     private OkHttpClient client;
     private Context context;
+    private String uuid;
+
+    private ByteArrayOutputStream reusableStream = new ByteArrayOutputStream();
 
     public NetworkManager(Context context) {
         this.context = context;
         this.client = createHttpClient();
+        this.uuid = UUIDManager.get(context);
     }
 
     private OkHttpClient createHttpClient() {
@@ -51,13 +55,19 @@ public class NetworkManager {
                 .build();
     }
 
-    public String uploadImage(Bitmap bitmap) throws IOException {
-        saveToPublicPictures(bitmap);
+    public String uploadImage(Bitmap bitmap, long timestamp) throws IOException {
+        //saveToPublicPictures(bitmap);
 
-        ByteArrayOutputStream stream = new ByteArrayOutputStream();
-        bitmap.compress(CompressFormat.JPEG, 70, stream);
+        /*ByteArrayOutputStream stream = new ByteArrayOutputStream();
+        bitmap.compress(CompressFormat.JPEG, 50, stream);
         byte[] byteArray = stream.toByteArray();
+        String base64Image = android.util.Base64.encodeToString(byteArray, android.util.Base64.DEFAULT);*/
+        // 2026/6/4
+        reusableStream.reset();
+        bitmap.compress(CompressFormat.JPEG, 50, reusableStream);
+        byte[] byteArray = reusableStream.toByteArray();
         String base64Image = android.util.Base64.encodeToString(byteArray, android.util.Base64.DEFAULT);
+        // 2026/6/4
 
         Gson gson = new Gson();
         JsonArray imagesArray = new JsonArray();
@@ -65,8 +75,8 @@ public class NetworkManager {
 
         JsonObject jsonBody = new JsonObject();
         jsonBody.add("images", imagesArray);
-        jsonBody.addProperty("timestamp", System.currentTimeMillis()); // 添加当前时间戳参数
-
+        jsonBody.addProperty("timestamp", timestamp); // 添加当前时间戳参数
+        jsonBody.addProperty("uuid", uuid);
         String jsonString = gson.toJson(jsonBody);
         // 创建JSON类型的请求体
         MediaType JSON = MediaType.parse("application/json; charset=utf-8");
