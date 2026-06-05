@@ -30,6 +30,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.LinkedBlockingQueue;
 import android.view.WindowManager;
 import android.view.WindowMetrics;
+import java.util.concurrent.Semaphore;
 
 public class ScreenCaptureService extends Service {
     private static final String TAG = "ScreenCaptureService";
@@ -78,6 +79,9 @@ public class ScreenCaptureService extends Service {
     private long latestFrameTimestamp;
     private volatile boolean hasNewFrame = false;
     // 2026/6/4
+    // 2026/6/5
+    private final Semaphore cycleSync = new Semaphore(1);
+    // 2026/6/5
 
     // 2026/6/3 start
     public static class CaptureFrame {
@@ -266,16 +270,30 @@ public class ScreenCaptureService extends Service {
         captureControlThread = new Thread(() -> {
             while(isRecording && !Thread.currentThread().isInterrupted()) {
                 try {
+                    //2026/6/5
+                    cycleSync.acquire();
+                    //2026/6/5
+
                     // --- 1. 开启采集窗口 ---
                     synchronized (captureLock) {
                         requestCleanFrame = true;
                         hasNewFrame = false; // 重置新帧标记
                     }
 
-                    sendBroadcast(new Intent(FloatingWindowService.ACTION_HIDE_WINDOW));
+                    // 2026/6/5
+                    //sendBroadcast(new Intent(FloatingWindowService.ACTION_HIDE_WINDOW));
 
                     // 悬浮窗隐藏并等待画面采集
-                    Thread.sleep(500);
+                    //Thread.sleep(500);
+
+                    // 【核心修改】：移除所有隐藏悬浮窗的代码
+                    // 智能等待新帧到来，最多等待 500ms（10次 * 50ms），防止 ImageReader 卡死导致线程永远阻塞
+                    int waitCount = 0;
+                    while (!hasNewFrame && waitCount < 10) {
+                        Thread.sleep(50);
+                        waitCount++;
+                    }
+                    // 2026/6/5
 
                     // --- 2. 结束采集窗口，获取最终参数 ---
                     boolean shouldConvert = false;
@@ -307,12 +325,24 @@ public class ScreenCaptureService extends Service {
                             }
                             frameQueue.offer(newFrame);
                         }
+                        else
+                        {
+                            //2026/6/5
+                            cycleSync.release();
+                            //2026/6/5
+                        }
+                    }
+                    else {
+                        //2026/6/5
+                        cycleSync.release();
+                        //2026/6/5
                     }
 
+                    // 2026/6/5
                     // --- 4. 恢复悬浮窗并进入休息期 ---
-                    sendBroadcast(new Intent(FloatingWindowService.ACTION_SHOW_WINDOW));
-                    Thread.sleep(500);
-
+                    //sendBroadcast(new Intent(FloatingWindowService.ACTION_SHOW_WINDOW));
+                    //Thread.sleep(500);
+                    // 2026/6/5
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     break;
@@ -587,6 +617,11 @@ public class ScreenCaptureService extends Service {
                             {
                                 bitmap.recycle();
                             }
+
+                            //2026/6/5
+                            Thread.sleep(1000);
+                            cycleSync.release();
+                            //2026/6/5
                         }
                     }
                 } catch (InterruptedException e)
@@ -598,6 +633,9 @@ public class ScreenCaptureService extends Service {
                     // 【核心修改】捕获 Throwable 而不是 Exception！
                     // 如果是缺依赖、OOM 等致命 Error，这里会立刻打印出来！
                     Log.e(TAG, "!!!! FATAL ERROR, Upload Thread !!!!", t);
+                    //2026/6/5
+                    cycleSync.release();
+                    //2026/6/5
                 }
             }
             Log.e(TAG, "==== upload thread terminate ====");
@@ -687,6 +725,8 @@ public class ScreenCaptureService extends Service {
         }
         isStopping.set(true);
         isRecording = false;
+
+        updateFloatingWindow("录制已停止，等待开始...");
 
         if(captureControlThread != null) {
             captureControlThread.interrupt();
